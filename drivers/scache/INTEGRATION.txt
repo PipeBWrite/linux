@@ -1,0 +1,147 @@
+StreamCache Two-Layer Memory - XFS Integration Hooks
+=====================================================
+
+This document describes where in XFS's buffered I/O path the StreamCache
+page allocator should replace the default kernel alloc_page() calls.
+
+1. ARCHITECTURE OVERVIEW
+========================
+
+The StreamCache allocator replaces alloc_page(GFP_KERNEL) calls on the
+buffered I/O hot path.  All other allocations (metadata, inode structures,
+etc.) continue to use the buddy allocator.
+
+The integration requires:
+  a) A per-file sc_per_file_cache embedded in the per-file entity (inode
+     private data or a concurrent hash table entry keyed by inode number).
+  b) Initialization of the cache at file open, destruction at last close.
+  c) Replacement of filemap_alloc_folio() / __page_cache_alloc() with
+     sc_alloc_page() in the read and write paths.
+  d) Replacement of folio_put() with sc_free_page() on eviction paths.
+
+2. WRITE PATH HOOKS
+====================
+
+2a. __filemap_get_folio() (mm/filemap.c)
+-----------------------------------------
+This is the primary page cache lookup + allocation function.  When a page
+cache miss occurs and FGP_CREAT is set, it calls:
+
+    folio = filemap_alloc_folio(gfp, order);
+
+Replace with:
+
+    if (sc_pool.enabled && mapping_has_sc_cache(mapping)) {
+        struct page *p = sc_alloc_page(
+            sc_get_file_cache(mapping), &sc_pool);
+        folio = p ? page_folio(p) : NULL;
+    } else {
+        folio = filemap_alloc_folio(gfp, order);
+    }
+
+2b. __filemap_get_folio_bg() (mm/filemap_bg.c)
+-----------------------------------------------
+The foreground BG-write path allocates folios in prepare_pages().  The
+existing folio pool (drivers/dma/dsa_sl/folio_pool.c) already provides
+custom allocation.  To use StreamCache's pool instead, replace the
+folio_pool_alloc() calls with sc_alloc_page().
+
+2c. generic_perform_write() (mm/filemap.c)
+-------------------------------------------
+The generic buffered write path calls __filemap_get_folio() with FGP_CREAT.
+No direct hook needed if 2a is implemented.
+
+3. READ PATH HOOKS
+===================
+
+3a. page_cache_ra_unbounded() (mm/readahead.c)
+-----------------------------------------------
+The readahead engine allocates pages with:
+
+    folio = filemap_alloc_folio(gfp, order);
+
+This is the highest-volume allocation point for sequential reads.
+Replace the same way as 2a.
+
+3b. filemap_get_pages() → filemap_create_folio() (mm/filemap.c)
+----------------------------------------------------------------
+On a read page cache miss without readahead, this creates a single folio.
+Uses filemap_alloc_folio() — same replacement pattern.
+
+4. EVICTION / FREE PATH HOOKS
+===============================
+
+4a. Page cache eviction (mm/vmscan.c or StreamCache's own LRU eviction)
+------------------------------------------------------------------------
+When StreamCache evicts a page from its stream LRU:
+
+    /* Instead of: */
+    folio_put(folio);
+
+    /* Use: */
+    sc_free_page(folio_page(folio, 0),
+                 sc_get_file_cache(folio->mapping), &sc_pool);
+
+This returns the page to the per-file cache (zeroed) for fast reuse.
+
+4b. truncate / invalidate paths
+--------------------------------
+truncate_inode_pages_range() and invalidate_mapping_pages() free folios.
+These need to check if the folio was allocated from the StreamCache pool
+(e.g., via a PG_private flag or folio->private pointer) and route to
+sc_free_page() instead of folio_put().
+
+5. FILE OPEN / CLOSE HOOKS
+============================
+
+5a. File open (fs/xfs/xfs_file.c: xfs_file_open)
+---------------------------------------------------
+    struct sc_per_file_cache *cache = sc_get_or_create_file_cache(inode);
+    sc_per_file_cache_init(cache, SC_LOW_MARK_DEFAULT,
+                           SC_HIGH_MARK_DEFAULT);
+
+5b. File close (fs/xfs/xfs_file.c: xfs_file_release or inode eviction)
+------------------------------------------------------------------------
+    struct sc_per_file_cache *cache = sc_get_file_cache(inode);
+    if (cache)
+        sc_per_file_cache_destroy(cache, &sc_pool);
+
+6. SYSFS CONTROL
+=================
+
+When "enabled" is written to 0 via /sys/fs/sc_memory/enabled:
+  - sc_memory_pool_destroy() frees all regions
+  - All subsequent allocations fall through to the normal alloc_page() path
+  - Existing pages already in the page cache remain valid (they are normal
+    struct page allocated via alloc_page at pool init time)
+
+When written to 1:
+  - sc_memory_pool_init() pre-allocates pages
+  - Subsequent I/O uses the StreamCache allocator
+
+7. MEMORY PRESSURE MONITORING
+===============================
+
+A background kthread should periodically call:
+
+    sc_update_memory_flag(&sc_pool);
+
+And react to the flag:
+  - SC_FLAG_NORMAL: no action
+  - SC_FLAG_LOW: trigger stream LRU eviction of clean pages
+  - SC_FLAG_URGENT: additionally call sc_shrink_all_caches()
+
+This kthread can be part of StreamCache's existing reclaiming thread pool.
+
+8. PAGE IDENTIFICATION
+=======================
+
+To distinguish StreamCache-allocated pages from buddy-allocated pages
+(needed for correct free path routing), options include:
+
+  a) Set PG_private and store a cookie in page->private
+  b) Check if page address falls within pool's known ranges
+  c) Track via the per-file entity (if file is SC-managed, all its
+     pages came from the pool)
+
+Option (c) is simplest if StreamCache fully manages all I/O for a file.

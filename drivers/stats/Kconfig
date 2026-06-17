@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# STATS driver configuration
+#
+
+config MISC_STATS
+	bool "Misc stats"
+	help
+	  Do multiple stats

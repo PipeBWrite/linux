@@ -1,0 +1,26 @@
+config SCACHE_MEMORY
+	tristate "StreamCache two-layer memory management"
+	default n
+	help
+	  Two-layer page pool for high-performance buffered I/O.
+
+	  Layer 1 is a system-level pool with per-CPU regions that
+	  pre-allocates pages at init time, bypassing the buddy allocator
+	  on the I/O critical path.  Layer 2 is a per-file cache that
+	  batches allocations from the pool for near-zero allocation
+	  latency.
+
+	  Runtime configuration is via /sys/fs/sc_memory/.
+
+	  If unsure, say N.
+
+config SCACHE_MEMORY_TEST
+	tristate "StreamCache memory management self-tests"
+	depends on SCACHE_MEMORY
+	default n
+	help
+	  Kernel module that runs self-tests for the StreamCache memory
+	  pool at load time and prints results to dmesg.  The module
+	  automatically unloads after running.
+
+	  If unsure, say N.
