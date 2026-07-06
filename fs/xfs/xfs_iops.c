@@ -30,6 +30,7 @@
 #include <linux/security.h>
 #include <linux/iversion.h>
 #include <linux/fiemap.h>
+#include <linux/pagemap.h>
 
 /*
  * Directories have different lock order w.r.t. mmap_lock compared to regular
@@ -1324,10 +1325,21 @@ xfs_setup_iops(
 	case S_IFREG:
 		inode->i_op = &xfs_inode_operations;
 		inode->i_fop = &xfs_file_operations;
-		if (IS_DAX(inode))
+		/*
+		 * Non-DAX XFS uses iomap buffered reads, which either fill
+		 * folio bytes through read I/O before marking them uptodate or
+		 * explicitly zero ranges for holes, unwritten extents, newly
+		 * allocated blocks, and post-EOF bytes. This lets readahead
+		 * skip allocator zeroing for folios wholly below i_size when
+		 * the runtime no-zero mode allows it.
+		 */
+		mapping_clear_ra_skip_zero_safe(inode->i_mapping);
+		if (IS_DAX(inode)) {
 			inode->i_mapping->a_ops = &xfs_dax_aops;
-		else
+		} else {
 			inode->i_mapping->a_ops = &xfs_address_space_operations;
+			mapping_set_ra_skip_zero_safe(inode->i_mapping);
+		}
 		break;
 	case S_IFDIR:
 		if (xfs_has_asciici(XFS_M(inode->i_sb)))

@@ -3879,22 +3879,33 @@ static const struct address_space_operations ext4_dax_aops = {
 
 void ext4_set_aops(struct inode *inode)
 {
+	/*
+	 * Non-DAX ext4 read paths either fill folio bytes through read I/O
+	 * before marking the folio uptodate or explicitly zero holes/tails.
+	 * This lets readahead skip allocator zeroing for folios wholly below
+	 * i_size when the runtime no-zero mode allows it.
+	 */
+	mapping_clear_ra_skip_zero_safe(inode->i_mapping);
 	switch (ext4_inode_journal_mode(inode)) {
 	case EXT4_INODE_ORDERED_DATA_MODE:
 	case EXT4_INODE_WRITEBACK_DATA_MODE:
 		break;
 	case EXT4_INODE_JOURNAL_DATA_MODE:
 		inode->i_mapping->a_ops = &ext4_journalled_aops;
+		mapping_set_ra_skip_zero_safe(inode->i_mapping);
 		return;
 	default:
 		BUG();
 	}
 	if (IS_DAX(inode))
 		inode->i_mapping->a_ops = &ext4_dax_aops;
-	else if (test_opt(inode->i_sb, DELALLOC))
+	else if (test_opt(inode->i_sb, DELALLOC)) {
 		inode->i_mapping->a_ops = &ext4_da_aops;
-	else
+		mapping_set_ra_skip_zero_safe(inode->i_mapping);
+	} else {
 		inode->i_mapping->a_ops = &ext4_aops;
+		mapping_set_ra_skip_zero_safe(inode->i_mapping);
+	}
 }
 
 /*

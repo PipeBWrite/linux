@@ -209,6 +209,7 @@ enum mapping_flags {
 	AS_STABLE_WRITES,	/* must wait for writeback before modifying
 				   folio contents */
 	AS_UNMOVABLE,		/* The mapping cannot be moved, ever */
+	AS_RA_SKIP_ZERO_SAFE,	/* readahead safely zeroes bytes not filled by I/O */
 };
 
 /**
@@ -360,6 +361,21 @@ static inline void mapping_set_gfp_mask(struct address_space *m, gfp_t mask)
 static inline void mapping_set_large_folios(struct address_space *mapping)
 {
 	__set_bit(AS_LARGE_FOLIO_SUPPORT, &mapping->flags);
+}
+
+static inline void mapping_set_ra_skip_zero_safe(struct address_space *mapping)
+{
+	set_bit(AS_RA_SKIP_ZERO_SAFE, &mapping->flags);
+}
+
+static inline void mapping_clear_ra_skip_zero_safe(struct address_space *mapping)
+{
+	clear_bit(AS_RA_SKIP_ZERO_SAFE, &mapping->flags);
+}
+
+static inline bool mapping_ra_skip_zero_safe(struct address_space *mapping)
+{
+	return test_bit(AS_RA_SKIP_ZERO_SAFE, &mapping->flags);
 }
 
 /*

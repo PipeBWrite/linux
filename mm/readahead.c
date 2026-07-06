@@ -130,6 +130,7 @@
 #include <linux/sched/mm.h>
 #include <linux/pagemap_bg.h>
 #include <linux/stats.h>
+#include <linux/dsa_emu.h>
 
 #include "internal.h"
 
@@ -188,6 +189,30 @@ static void read_pages(struct readahead_control *rac)
 	rac->_workingset = false;
 
 	BUG_ON(readahead_count(rac));
+}
+
+static bool readahead_skip_zero_alloc_safe(struct address_space *mapping,
+					   struct inode *inode, pgoff_t index,
+					   unsigned int order)
+{
+	pgoff_t nr_pages = 1UL << order;
+	pgoff_t full_pages;
+
+	if (READ_ONCE(dsa_emu_no_zero_alloc) != 2)
+		return false;
+	if (!mapping_ra_skip_zero_safe(mapping))
+		return false;
+	if (!inode || !stats_is_inode_bdev_valid(inode))
+		return false;
+
+	/*
+	 * Only skip allocator zeroing for folios fully covered by i_size.  The
+	 * filesystem opt-in means its readahead/read_folio path either submits
+	 * data I/O before the folio can become uptodate or explicitly zeroes
+	 * every byte not filled by I/O.
+	 */
+	full_pages = i_size_read(inode) >> PAGE_SHIFT;
+	return index <= full_pages && nr_pages <= full_pages - index;
 }
 
 /**
@@ -275,7 +300,14 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 			folio = sc_page ? page_folio(sc_page) : NULL;
 		} else
 #endif
-		folio = filemap_alloc_folio(gfp_mask, 0);
+		{
+			gfp_t alloc_gfp = gfp_mask;
+
+			if (readahead_skip_zero_alloc_safe(mapping, inode,
+							   index + i, 0))
+				alloc_gfp |= __GFP_SKIP_ZERO_BBN;
+			folio = filemap_alloc_folio(alloc_gfp, 0);
+		}
 		if (!folio)
 			break;
 		if (filemap_add_folio(mapping, folio, index + i,
@@ -496,14 +528,22 @@ static inline int ra_alloc_folio(struct readahead_control *ractl, pgoff_t index,
 		pgoff_t mark, unsigned int order, gfp_t gfp)
 {
 	int err;
-	struct folio *folio = filemap_alloc_folio(gfp, order);
+	struct address_space *mapping = ractl->mapping;
+	struct inode *inode = mapping->host;
+	gfp_t alloc_gfp = gfp;
+	struct folio *folio;
+
+	if (readahead_skip_zero_alloc_safe(mapping, inode, index, order))
+		alloc_gfp |= __GFP_SKIP_ZERO_BBN;
+
+	folio = filemap_alloc_folio(alloc_gfp, order);
 
 	if (!folio)
 		return -ENOMEM;
 	mark = round_down(mark, 1UL << order);
 	if (index == mark)
 		folio_set_readahead(folio);
-	err = filemap_add_folio(ractl->mapping, folio, index, gfp);
+	err = filemap_add_folio(mapping, folio, index, gfp);
 	if (err) {
 		folio_put(folio);
 		return err;
