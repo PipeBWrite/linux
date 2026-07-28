@@ -81,10 +81,15 @@ struct dsa_emu_flush_work {
 	struct inode *inode;
 };
 
+/* progress-gated backoff: consecutive stalled+backlogged batches before backing off */
+#define DSA_EMU_BACKOFF_BAD_BATCHES 2
+
 struct dsa_emu_kthread_queue {
 	struct llist_head head;
+	wait_queue_head_t wait;		/* wake-on-submit (sleep_policy=waitqueue) */
 	int backoff;			/* BG sets when overloaded; FG reads */
 	u64 backoff_until_ns;		/* ktime deadline before clearing */
+	u32 stall_streak;		/* consecutive stalled+backlogged batches */
 } ____cacheline_aligned_in_smp;
 
 static struct dsa_emu_kthread_queue kthread_queue[NUM_THREADS_MAX];
@@ -335,14 +340,52 @@ static void dsa_emu_rebuild_cpu_to_wq(uint32_t num_wqs)
 		if (!n_on_node)
 			continue;	/* no worker on this node: keep fallback */
 
+		/*
+		 * Order on_node_wqs[] by ascending pinned CPU so both the
+		 * default round-robin and the mirror (i -> n-1-i) map by
+		 * actual CPU position, not the worker-index order the array
+		 * was built in.  One-worker-per-core layouts are already
+		 * sorted; insertion sort is cheap (n_on_node <= per-node CPUs).
+		 */
+		for (int a = 1; a < n_on_node; a++) {
+			int key = on_node_wqs[a];
+			int kc = READ_ONCE(wq_cpu[key]);
+			int b = a - 1;
+
+			while (b >= 0 &&
+			       READ_ONCE(wq_cpu[on_node_wqs[b]]) > kc) {
+				on_node_wqs[b + 1] = on_node_wqs[b];
+				b--;
+			}
+			on_node_wqs[b + 1] = key;
+		}
+
+		bool mirror = READ_ONCE(dsa_emu_cpu_to_wq_mirror);
+
 		for_each_cpu(cpu, mask) {
+			int slot;
+
 			if (cpu >= nr_cpu_ids || !cpu_online(cpu))
 				continue;
-			WRITE_ONCE(cpu_to_wq[cpu],
-				   on_node_wqs[local_idx % n_on_node]);
+			slot = local_idx % n_on_node;
+			/*
+			 * mirror: map the i-th on-node CPU to the (n-1-i)-th
+			 * on-node worker, so a submitter and its default BG
+			 * worker sit at opposite ends of the node (e.g. node-0
+			 * CPU0 -> CPU76 with one worker per core).
+			 */
+			if (mirror)
+				slot = n_on_node - 1 - slot;
+			WRITE_ONCE(cpu_to_wq[cpu], on_node_wqs[slot]);
 			local_idx++;
 		}
 	}
+}
+
+void dsa_emu_rebuild_cpu_to_wq_pub(void)
+{
+	if (num_threads)
+		dsa_emu_rebuild_cpu_to_wq(num_threads);
 }
 
 static inline void dsa_emu_reset_req(struct dsa_emu_memcpy_req *req, bool from_pool)
@@ -898,10 +941,17 @@ static int dsa_emu_kthread_fn(void *arg)
 	struct llist_node *node;
 	struct dsa_emu_memcpy_req *req;
 	struct dsa_emu_kthread_queue *q = &kthread_queue[idx];
+	u32 idle_iters = 0;
 
 	while (!kthread_should_stop()) {
-		/* Grab all pending requests atomically */
-		node = llist_del_all(&q->head);
+		/*
+		 * Grab all pending requests atomically.  Gate the atomic
+		 * xchg behind a plain llist_empty() read: we are the sole
+		 * consumer of this queue, so idle spinning/polling can probe
+		 * with a shared load instead of an exclusive RMW that would
+		 * ping-pong the head cacheline FG submitters write.
+		 */
+		node = llist_empty(&q->head) ? NULL : llist_del_all(&q->head);
 		if (node) {
 			u64 start_wall_ns = 0;
 			u64 start_cpu_ns = 0;
@@ -942,8 +992,29 @@ static int dsa_emu_kthread_fn(void *arg)
 				u64 stalled_ns = wall_ns > cpu_ns ?
 						 wall_ns - cpu_ns : 0;
 				u64 per_ent = stalled_ns / total_ents;
+				bool stalled = per_ent > threshold;
+				bool congested = false;
 
-				if (per_ent > threshold) {
+				/*
+				 * A high stall alone is ambiguous: a SCHED_IDLE
+				 * worker is off-CPU whenever the scheduler lets
+				 * the app run, which is benign.  With the progress
+				 * gate, treat it as congestion only if the queue
+				 * ALSO failed to drain (backlog left after this
+				 * batch) for >= 2 consecutive batches.  Draining
+				 * to empty (idle path) resets the streak.
+				 */
+				if (READ_ONCE(dsa_emu_backoff_progress_gate)) {
+					if (stalled && !llist_empty(&q->head))
+						congested = (++q->stall_streak >=
+							DSA_EMU_BACKOFF_BAD_BATCHES);
+					else
+						q->stall_streak = 0;
+				} else {
+					congested = stalled;
+				}
+
+				if (congested) {
 					DSA_EMU_STAT_INC(backoff_enter);
 					DSA_EMU_STAT_ADD(backoff_stall_ns,
 							 stalled_ns);
@@ -952,25 +1023,68 @@ static int dsa_emu_kthread_fn(void *arg)
 					DSA_EMU_STAT_ADD(backoff_cpu_ns,
 							 cpu_ns);
 					dsa_emu_set_backoff(q);
-				} else if (READ_ONCE(q->backoff)) {
+				} else if (!stalled && READ_ONCE(q->backoff)) {
 					/* Contention gone — recover early */
 					dsa_emu_clear_backoff(q);
 				}
 			}
 			/* Busy-poll: skip sleep when work was available */
+			idle_iters = 0;
 			continue;
 		}
 
+		/* Drained to empty: caught up, so reset the stall streak. */
+		q->stall_streak = 0;
 		/* Clear backoff when idle and cooldown has expired. */
 		if (READ_ONCE(q->backoff) &&
 		    ktime_get_ns() >= q->backoff_until_ns)
 			dsa_emu_clear_backoff(q);
 
 		/* Sleep only when idle */
-		{
+		switch (READ_ONCE(dsa_emu_sleep_policy)) {
+		case DSA_EMU_SLEEP_WAITQUEUE:
+			/*
+			 * wake-on-submit: sleep on the per-queue waitqueue,
+			 * woken by submitters on the empty->nonempty edge.
+			 * Bounded timeout is a lost-wakeup safety net and lets
+			 * the loop re-check backoff expiry.
+			 */
+			wait_event_interruptible_timeout(q->wait,
+				!llist_empty(&q->head) || kthread_should_stop(),
+				usecs_to_jiffies(1000));
+			break;
+		case DSA_EMU_SLEEP_HYBRID: {
+			/*
+			 * hot/warm/cold: spin briefly while work is recent,
+			 * then short-sleep, then fall back to the waitqueue
+			 * once sustained-idle.  Keeps 4 KB bursts low-latency
+			 * (hot/warm poll) while still yielding the core and
+			 * cutting wakeups when genuinely idle (cold wait).
+			 */
+			u32 hot = READ_ONCE(dsa_emu_hybrid_hot_iters);
+			u32 warm = READ_ONCE(dsa_emu_hybrid_warm_iters);
+
+			if (idle_iters < hot) {
+				cpu_relax();
+			} else if ((u64)idle_iters < (u64)hot + warm) {
+				u32 poll_usecs = dsa_emu_idle_poll_usecs();
+
+				usleep_range(poll_usecs, poll_usecs + 10);
+			} else {
+				wait_event_interruptible_timeout(q->wait,
+					!llist_empty(&q->head) ||
+						kthread_should_stop(),
+					usecs_to_jiffies(1000));
+			}
+			idle_iters++;
+			break;
+		}
+		default: {
 			u32 poll_usecs = dsa_emu_idle_poll_usecs();
 
 			usleep_range(poll_usecs, poll_usecs + 10);
+			break;
+		}
 		}
 	}
 
@@ -1105,7 +1219,10 @@ retry:
 		  "dsa_emu: req %px resubmitted while still chained\n", req);
 	atomic_inc(&dsa_emu_submit_inflight);
 	if (likely(READ_ONCE(wq_inited))) {
-		llist_add(&req->lnode, &kthread_queue[req->target_wq_idx].head);
+		if (llist_add(&req->lnode,
+			      &kthread_queue[req->target_wq_idx].head) &&
+		    READ_ONCE(dsa_emu_sleep_policy))
+			wake_up(&kthread_queue[req->target_wq_idx].wait);
 		atomic_dec(&dsa_emu_submit_inflight);
 	} else {
 		atomic_dec(&dsa_emu_submit_inflight);
@@ -1135,7 +1252,10 @@ void dsa_emu_submit_in_drain(struct dsa_emu_memcpy_req *req,
 	dsa_emu_record_pending_submit_depth(pending_after, pending_ents);
 	atomic_inc(&dsa_emu_submit_inflight);
 	if (likely(READ_ONCE(wq_inited))) {
-		llist_add(&req->lnode, &kthread_queue[req->target_wq_idx].head);
+		if (llist_add(&req->lnode,
+			      &kthread_queue[req->target_wq_idx].head) &&
+		    READ_ONCE(dsa_emu_sleep_policy))
+			wake_up(&kthread_queue[req->target_wq_idx].wait);
 		atomic_dec(&dsa_emu_submit_inflight);
 	} else {
 		atomic_dec(&dsa_emu_submit_inflight);
@@ -1240,7 +1360,10 @@ retry:
 			reqs[i]->lnode.next = &reqs[i - 1]->lnode;
 		last = &reqs[0]->lnode;
 		last->next = NULL;
-		llist_add_batch(first, last, &kthread_queue[target_wq_idx].head);
+		if (llist_add_batch(first, last,
+				    &kthread_queue[target_wq_idx].head) &&
+		    READ_ONCE(dsa_emu_sleep_policy))
+			wake_up(&kthread_queue[target_wq_idx].wait);
 		atomic_dec(&dsa_emu_submit_inflight);
 	} else {
 		atomic_dec(&dsa_emu_submit_inflight);
@@ -1325,8 +1448,10 @@ int dsa_emu_init_kthreads(uint32_t num_kthreads)
 		/* destroy_kthreads drains queues; anything here is a bug. */
 		WARN_ON_ONCE(!llist_empty(&kthread_queue[i].head));
 		init_llist_head(&kthread_queue[i].head);
+		init_waitqueue_head(&kthread_queue[i].wait);
 		WRITE_ONCE(kthread_queue[i].backoff, 0);
 		kthread_queue[i].backoff_until_ns = 0;
+		kthread_queue[i].stall_streak = 0;
 
 		kthreads[i] = kthread_create(dsa_emu_kthread_fn,
 					     (void *)(long)i,

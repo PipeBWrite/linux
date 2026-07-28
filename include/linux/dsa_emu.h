@@ -573,6 +573,7 @@ static __always_inline void prefetchw_for_write(const void *x)
 extern uint32_t dsa_emu_prefetch;
 extern uint32_t dsa_emu_nt_store;
 extern uint32_t dsa_emu_nt_store_min_bytes;
+extern uint32_t dsa_emu_sleep_policy;
 
 extern uint32_t dsa_emu_no_zero_alloc;
 
@@ -603,6 +604,19 @@ extern uint32_t dsa_emu_fsync_fallback_denominator;
 extern uint32_t dsa_emu_fsync_fallback_recovery_writes;
 extern uint32_t dsa_emu_backoff_threshold_ns;
 extern uint32_t dsa_emu_backoff_duration_ns;
+extern uint32_t dsa_emu_backoff_progress_gate;
 extern uint32_t dsa_emu_worker_sched_idle;
+extern uint32_t dsa_emu_cpu_to_wq_mirror;
+extern uint32_t dsa_emu_hybrid_hot_iters;
+extern uint32_t dsa_emu_hybrid_warm_iters;
+
+/* dsa_emu_sleep_policy values */
+enum {
+	DSA_EMU_SLEEP_POLL = 0,
+	DSA_EMU_SLEEP_WAITQUEUE = 1,
+	DSA_EMU_SLEEP_HYBRID = 2,
+};
+
+void dsa_emu_rebuild_cpu_to_wq_pub(void);
 
 #endif

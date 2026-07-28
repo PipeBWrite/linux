@@ -18,6 +18,7 @@ uint32_t dsa_emu_force_node __read_mostly = 0;
 uint32_t dsa_emu_force_node_nid __read_mostly = 0;
 uint32_t dsa_emu_prefetch __read_mostly = 0;
 uint32_t dsa_emu_nt_store __read_mostly = 1;
+uint32_t dsa_emu_sleep_policy __read_mostly = 0; /* enum DSA_EMU_SLEEP_*: 0=poll, 1=waitqueue, 2=hybrid */
 uint32_t dsa_emu_nt_store_min_bytes __read_mostly = 256 * 1024;
 uint32_t dsa_emu_no_zero_alloc __read_mostly = 0;
 uint32_t dsa_emu_ignored_inode_min __read_mostly = 0;
@@ -62,7 +63,11 @@ uint32_t dsa_emu_fsync_fallback_denominator __read_mostly = 2;
 uint32_t dsa_emu_fsync_fallback_recovery_writes __read_mostly = 64;
 uint32_t dsa_emu_backoff_threshold_ns __read_mostly = 0;
 uint32_t dsa_emu_backoff_duration_ns __read_mostly = 1000000; /* 1ms */
+uint32_t dsa_emu_backoff_progress_gate __read_mostly = 0;
 uint32_t dsa_emu_worker_sched_idle __read_mostly = 0;
+uint32_t dsa_emu_cpu_to_wq_mirror __read_mostly = 0;
+uint32_t dsa_emu_hybrid_hot_iters __read_mostly = 256;
+uint32_t dsa_emu_hybrid_warm_iters __read_mostly = 32;
 
 static ssize_t folio_pool_order_max_store_fn(const char *buf, size_t count)
 {
@@ -143,6 +148,7 @@ SYSFS_STRING_ARRAY(debug_defer_blk_write_begin,
 SYSFS_STRING_ARRAY(fg_bwb_all, dsa_emu_fg_bwb_all, "off", "on");
 SYSFS_STRING_ARRAY(bg_batch_handle, dsa_emu_bg_batch_handle, "off", "on");
 SYSFS_STRING_ARRAY(sfr_drain, dsa_emu_sfr_drain, "off", "on");
+SYSFS_STRING_ARRAY(sleep_policy, dsa_emu_sleep_policy, "poll", "waitqueue", "hybrid");
 
 static ssize_t dsa_emu_thread_numa_show(struct kobject *kobj,
 					struct kobj_attribute *attr, char *buf)
@@ -178,7 +184,23 @@ SYSFS_UINT_ATTR(fsync_fallback_recovery_writes,
 		dsa_emu_fsync_fallback_recovery_writes);
 SYSFS_UINT_ATTR(backoff_threshold_ns, dsa_emu_backoff_threshold_ns);
 SYSFS_UINT_ATTR(backoff_duration_ns, dsa_emu_backoff_duration_ns);
+SYSFS_UINT_ATTR(backoff_progress_gate, dsa_emu_backoff_progress_gate);
 SYSFS_UINT_ATTR(worker_sched_idle, dsa_emu_worker_sched_idle);
+SYSFS_UINT_ATTR(hybrid_hot_iters, dsa_emu_hybrid_hot_iters);
+SYSFS_UINT_ATTR(hybrid_warm_iters, dsa_emu_hybrid_warm_iters);
+
+static ssize_t cpu_to_wq_mirror_store_fn(const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+	dsa_emu_cpu_to_wq_mirror = !!val;
+	dsa_emu_rebuild_cpu_to_wq_pub();
+	return count;
+}
+SYSFS_UINT_ATTR_CUSTOM(cpu_to_wq_mirror, dsa_emu_cpu_to_wq_mirror,
+		       cpu_to_wq_mirror_store_fn);
 
 SYSFS_STRING_ARRAY(debug_origin_bdp_mode, dsa_emu_debug_origin_bdp_mode,
 		   "normal", "no_wb", "fg_wb");
@@ -203,6 +225,7 @@ static struct attribute *dsa_emu_attrs[] = {
 	&fg_bwb_all_attr.attr,
 	&bg_batch_handle_attr.attr,
 	&sfr_drain_attr.attr,
+	&sleep_policy_attr.attr,
 	&dsa_emu_thread_numa_attr.attr,
 	&debug_dirty_threshold_attr.attr,
 	&debug_fsync_skip_attr.attr,
@@ -215,7 +238,11 @@ static struct attribute *dsa_emu_attrs[] = {
 	&fsync_fallback_recovery_writes_attr.attr,
 	&backoff_threshold_ns_attr.attr,
 	&backoff_duration_ns_attr.attr,
+	&backoff_progress_gate_attr.attr,
 	&worker_sched_idle_attr.attr,
+	&cpu_to_wq_mirror_attr.attr,
+	&hybrid_hot_iters_attr.attr,
+	&hybrid_warm_iters_attr.attr,
 	&folio_pool_order_max_attr.attr,
 	&static_folio_pool_size_attr.attr,
 	NULL
